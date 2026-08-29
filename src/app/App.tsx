@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import {
   Cell,
   Legend,
@@ -132,6 +140,9 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = state.ledger?.settings.theme || 'system';
   }, [state.ledger?.settings.theme]);
+  useLayoutEffect(() => {
+    window.scrollTo(0, 0);
+  }, [page]);
   const refreshSummaries = async () => setSummaries(await persistence.list());
   const importLedger = async () => {
     try {
@@ -774,6 +785,32 @@ function Modal({
   onCancel: () => void;
   children: ReactNode;
 }) {
+  useLayoutEffect(() => {
+    const { body } = document;
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+    const previousStyles = {
+      left: body.style.left,
+      overflow: body.style.overflow,
+      position: body.style.position,
+      right: body.style.right,
+      top: body.style.top,
+      width: body.style.width,
+    };
+
+    body.style.overflow = 'hidden';
+    body.style.position = 'fixed';
+    body.style.top = `-${scrollY}px`;
+    body.style.left = `-${scrollX}px`;
+    body.style.right = '0';
+    body.style.width = '100%';
+
+    return () => {
+      Object.assign(body.style, previousStyles);
+      window.scrollTo(scrollX, scrollY);
+    };
+  }, []);
+
   return (
     <div className="modal-backdrop">
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
