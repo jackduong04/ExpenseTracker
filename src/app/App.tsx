@@ -1,5 +1,16 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  Cell,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import { dashboardStats, filterTransactions, trendData } from '../domain/ledger/calculations';
 import { dateRangeForPreset, todayLocal } from '../domain/ledger/dates';
 import { formatMinorUnits, parseMoneyInputToMinorUnits } from '../domain/ledger/money';
@@ -14,9 +25,10 @@ import type {
 } from '../domain/ledger/types';
 import { BrowserLedgerFileService } from '../infrastructure/files/BrowserLedgerFileService';
 import {
-  getRevisionMetadata,
-  setRevisionMetadata,
-} from '../infrastructure/persistence/revision-metadata';
+  BrowserLedgerPersistence,
+  type LedgerSummary,
+} from '../infrastructure/persistence/BrowserLedgerPersistence';
+import { stableSerialize } from '../infrastructure/schema/parse-ledger';
 import {
   categoryDraft,
   makeId,
@@ -29,6 +41,7 @@ import {
 
 type Page = 'dashboard' | 'transactions' | 'categories' | 'settings';
 const files = new BrowserLedgerFileService();
+const persistence = new BrowserLedgerPersistence();
 const starter = () =>
   (
     [
@@ -45,9 +58,28 @@ export default function App() {
   const { state, dispatch } = useStore();
   const dirty = useDirty();
   const [page, setPage] = useState<Page>('dashboard');
-  const [dialog, setDialog] = useState<'new' | 'transaction' | null>(null);
+  const [dialog, setDialog] = useState<
+    'new' | 'transaction' | 'transaction-actions' | 'category-actions' | null
+  >(null);
   const [editing, setEditing] = useState<Transaction | null>(null);
+  const [transactionMode, setTransactionMode] = useState<'add' | 'edit' | 'duplicate'>('add');
+  const [selectedCategory, setSelectedCategory] = useState<Ledger['categories'][number] | null>(
+    null,
+  );
   const [toast, setToast] = useState<string | null>(null);
+  const [booting, setBooting] = useState(true);
+  const [summaries, setSummaries] = useState<LedgerSummary[]>([]);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const ledgerRef = useRef(state.ledger);
+  const committedRef = useRef<Ledger | null>(null);
+  const nextRevisionRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queueRef = useRef(Promise.resolve());
+  useEffect(() => {
+    ledgerRef.current = state.ledger;
+    if (state.ledger)
+      nextRevisionRef.current = Math.max(nextRevisionRef.current, state.ledger.revision);
+  }, [state.ledger]);
   useEffect(() => {
     if (!state.message) return;
     setToast(state.message);
@@ -65,86 +97,192 @@ export default function App() {
     return () => removeEventListener('beforeunload', fn);
   }, [dirty]);
   useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const activeId = await persistence.getActiveId();
+        if (activeId) {
+          try {
+            const loaded = await persistence.load(activeId);
+            if (!cancelled) {
+              dispatch({
+                type: 'load',
+                ledger: loaded.ledger,
+                filename: loaded.record.filename,
+                hash: loaded.record.hash,
+              });
+              committedRef.current = loaded.ledger;
+              nextRevisionRef.current = loaded.ledger.revision;
+            }
+          } catch (error) {
+            if (!cancelled) setToast((error as Error).message);
+          }
+        }
+        if (!cancelled) setSummaries(await persistence.list());
+      } catch (error) {
+        if (!cancelled) setToast((error as Error).message);
+      } finally {
+        if (!cancelled) setBooting(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch]);
+  useEffect(() => {
     document.documentElement.dataset.theme = state.ledger?.settings.theme || 'system';
   }, [state.ledger?.settings.theme]);
-  const open = async () => {
+  const refreshSummaries = async () => setSummaries(await persistence.list());
+  const importLedger = async () => {
     try {
-      const result = await files.open();
+      const result = await files.importLedger();
       if (!result) return;
-      const previous = getRevisionMetadata();
-      const stale =
-        previous?.ledgerId === result.ledger.ledgerId &&
-        result.ledger.revision < previous.lastSeenRevision;
-      const conflict =
-        previous?.ledgerId === result.ledger.ledgerId &&
-        result.ledger.revision === previous.lastSeenRevision &&
-        result.hash !== previous.contentHash;
-      if (
-        (stale &&
-          !confirm(
-            'This file is older than the last revision seen on this device. Open it anyway?',
-          )) ||
-        (conflict &&
-          !confirm('This file may be a conflicting copy with the same revision. Open it anyway?'))
-      )
-        return;
-      dispatch({ type: 'load', ...result });
-      setRevisionMetadata({
-        ledgerId: result.ledger.ledgerId,
-        lastSeenRevision: result.ledger.revision,
-        contentHash: result.hash,
+      const existing = await persistence.getRecord(result.ledger.ledgerId);
+      if (existing && existing.hash !== result.hash) {
+        const ok = confirm(
+          `A local copy already exists (revision ${existing.revision}, updated ${existing.updatedAt}). Replace it with the imported revision ${result.ledger.revision}?`,
+        );
+        if (!ok) return;
+      }
+      const record = await persistence.save(result.ledger, result.filename);
+      dispatch({
+        type: 'load',
+        ledger: result.ledger,
+        filename: record.filename,
+        hash: record.hash,
       });
+      nextRevisionRef.current = result.ledger.revision;
+      await refreshSummaries();
     } catch (error) {
       setToast((error as Error).message);
     }
   };
-  const save = async (backup: boolean) => {
-    if (!state.ledger) return;
+  const commitLatest = useCallback(async () => {
+    const source = ledgerRef.current;
+    if (!source || !dirty) return;
+    const sourceSnapshot = stableSerialize(source);
+    const ledger = {
+      ...source,
+      revision: ++nextRevisionRef.current,
+      updatedAt: new Date().toISOString(),
+    };
+    committedRef.current = ledger;
+    setSaveStatus('saving');
+    const task = queueRef.current.then(async () => {
+      const record = await persistence.save(
+        ledger,
+        state.filename || `expense-tracker-${ledger.name}.json`,
+      );
+      dispatch({
+        type: 'autosaved',
+        ledger,
+        filename: record.filename,
+        hash: record.hash,
+        sourceSnapshot,
+      });
+    });
+    queueRef.current = task.catch(() => undefined);
     try {
-      const ledger = {
-        ...state.ledger,
-        revision: state.ledger.revision + 1,
-        updatedAt: new Date().toISOString(),
-      };
-      const result =
-        backup || !state.filename
-          ? await files.exportCopy(ledger)
-          : await files.save(ledger, state.handle);
-      dispatch({ type: 'saved', ledger, ...result });
-      setRevisionMetadata({
-        ledgerId: ledger.ledgerId,
-        lastSeenRevision: ledger.revision,
-        contentHash: result.hash,
+      await task;
+      setSaveStatus('saved');
+      await refreshSummaries();
+    } catch (error) {
+      setSaveStatus('error');
+      setToast((error as Error).message);
+      throw error;
+    }
+  }, [dirty, dispatch, state.filename]);
+  const flush = useCallback(async () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = null;
+    if (dirty) await commitLatest();
+    await queueRef.current;
+  }, [commitLatest, dirty]);
+  useEffect(() => {
+    if (!dirty) return;
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => void commitLatest().catch(() => undefined), 300);
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, [dirty, commitLatest, state.ledger]);
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') void flush().catch(() => undefined);
+    };
+    addEventListener('visibilitychange', onVisibility);
+    return () => removeEventListener('visibilitychange', onVisibility);
+  }, [flush]);
+  const createLedger = async (ledger: Ledger) => {
+    const record = await persistence.save(ledger);
+    dispatch({ type: 'load', ledger, filename: record.filename, hash: record.hash });
+    committedRef.current = ledger;
+    nextRevisionRef.current = ledger.revision;
+    await refreshSummaries();
+    setDialog(null);
+  };
+  const selectLedger = async (ledgerId: string) => {
+    try {
+      await flush();
+      const loaded = await persistence.load(ledgerId);
+      await persistence.activate(ledgerId);
+      dispatch({
+        type: 'load',
+        ledger: loaded.ledger,
+        filename: loaded.record.filename,
+        hash: loaded.record.hash,
       });
+      committedRef.current = loaded.ledger;
+      nextRevisionRef.current = loaded.ledger.revision;
+      setPage('dashboard');
     } catch (error) {
       setToast((error as Error).message);
     }
   };
-  const close = () => {
-    if (dirty && !confirm('You have unsaved changes. Close this ledger anyway?')) return;
+  const close = async () => {
+    try {
+      await flush();
+    } catch {
+      if (!confirm('Local save failed. Switch ledgers and discard these in-memory changes?'))
+        return;
+    }
     dispatch({ type: 'close' });
+    await refreshSummaries();
     setPage('dashboard');
   };
+  const exportBackup = async () => {
+    if (!state.ledger) return;
+    try {
+      await flush();
+      await files.exportCopy(committedRef.current || ledgerRef.current || state.ledger);
+    } catch (error) {
+      setToast((error as Error).message);
+    }
+  };
+  if (booting)
+    return (
+      <div className="welcome">
+        <div className="welcome-card">
+          <p className="muted">Loading local ledgers…</p>
+        </div>
+      </div>
+    );
   if (!state.ledger)
     return (
-      <Welcome
-        onOpen={open}
+      <LedgerLibrary
+        summaries={summaries}
+        onOpen={importLedger}
+        onSelect={selectLedger}
+        onDelete={async (id) => {
+          if (confirm('Delete this browser copy? Export a backup first if you need to keep it.')) {
+            await persistence.remove(id);
+            await refreshSummaries();
+          }
+        }}
         onNew={() => setDialog('new')}
         dialog={
           dialog === 'new' ? (
-            <NewLedger
-              onCancel={() => setDialog(null)}
-              onCreate={async (ledger) => {
-                const result = await files.exportCopy(ledger);
-                dispatch({ type: 'saved', ledger, ...result });
-                setRevisionMetadata({
-                  ledgerId: ledger.ledgerId,
-                  lastSeenRevision: ledger.revision,
-                  contentHash: result.hash,
-                });
-                setDialog(null);
-              }}
-            />
+            <NewLedger onCancel={() => setDialog(null)} onCreate={createLedger} />
           ) : null
         }
       />
@@ -160,20 +298,28 @@ export default function App() {
         </button>
         <div className="ledger-status">
           <span className={dirty ? 'status-dot dirty' : 'status-dot'}></span>
-          <span>{dirty ? 'Unsaved changes' : 'Saved'}</span>
+          <span>
+            {saveStatus === 'saving'
+              ? 'Saving…'
+              : saveStatus === 'error'
+                ? 'Save failed'
+                : dirty
+                  ? 'Unsaved changes'
+                  : 'Saved locally'}
+          </span>
           <small>
             {state.filename} · r{state.ledger.revision}
           </small>
         </div>
         <div className="top-actions">
-          <button onClick={() => save(false)} disabled={!dirty}>
-            Save
-          </button>
-          <button className="secondary" onClick={() => save(true)}>
+          {saveStatus === 'error' && (
+            <button onClick={() => void commitLatest().catch(() => undefined)}>Retry</button>
+          )}
+          <button className="secondary" onClick={() => void exportBackup()}>
             Export backup
           </button>
-          <button className="icon-button" aria-label="Close ledger" onClick={close}>
-            ×
+          <button className="icon-button" aria-label="Switch ledger" onClick={() => void close()}>
+            ⇄
           </button>
         </div>
       </header>
@@ -182,6 +328,7 @@ export default function App() {
           {(['dashboard', 'transactions', 'categories', 'settings'] as Page[]).map((item) => (
             <button
               key={item}
+              aria-label={item[0].toUpperCase() + item.slice(1)}
               className={page === item ? 'nav-item active' : 'nav-item'}
               onClick={() => setPage(item)}
             >
@@ -200,6 +347,7 @@ export default function App() {
               ledger={state.ledger}
               onAdd={() => {
                 setEditing(null);
+                setTransactionMode('add');
                 setDialog('transaction');
               }}
             />
@@ -210,15 +358,30 @@ export default function App() {
               onChange={change}
               onAdd={() => {
                 setEditing(null);
+                setTransactionMode('add');
                 setDialog('transaction');
               }}
               onEdit={(transaction) => {
                 setEditing(transaction);
+                setTransactionMode('edit');
                 setDialog('transaction');
+              }}
+              onSelect={(transaction) => {
+                setEditing(transaction);
+                setDialog('transaction-actions');
               }}
             />
           )}
-          {page === 'categories' && <Categories ledger={state.ledger} onChange={change} />}
+          {page === 'categories' && (
+            <Categories
+              ledger={state.ledger}
+              onChange={change}
+              onSelect={(category) => {
+                setSelectedCategory(category);
+                setDialog('category-actions');
+              }}
+            />
+          )}
           {page === 'settings' && <Settings ledger={state.ledger} onChange={change} />}
         </main>
       </div>
@@ -231,15 +394,67 @@ export default function App() {
         <TransactionDialog
           ledger={state.ledger}
           initial={editing}
+          mode={transactionMode}
           onCancel={() => setDialog(null)}
           onSave={(transaction) => {
             change((old) => ({
               ...old,
-              transactions: editing
-                ? old.transactions.map((item) => (item.id === transaction.id ? transaction : item))
-                : [...old.transactions, transaction],
+              transactions:
+                transactionMode === 'edit'
+                  ? old.transactions.map((item) =>
+                      item.id === transaction.id ? transaction : item,
+                    )
+                  : [...old.transactions, transaction],
             }));
             setDialog(null);
+          }}
+        />
+      )}
+      {dialog === 'transaction-actions' && editing && (
+        <TransactionActions
+          transaction={editing}
+          ledger={state.ledger}
+          onCancel={() => setDialog(null)}
+          onEdit={() => {
+            setTransactionMode('edit');
+            setDialog('transaction');
+          }}
+          onDuplicate={() => {
+            setTransactionMode('duplicate');
+            setDialog('transaction');
+            setEditing({
+              ...editing,
+              id: makeId(),
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+          }}
+          onDelete={() => {
+            if (confirm('Delete this transaction?')) {
+              change((l) => ({
+                ...l,
+                transactions: l.transactions.filter((t) => t.id !== editing.id),
+              }));
+              setDialog(null);
+            }
+          }}
+        />
+      )}
+      {dialog === 'category-actions' && selectedCategory && (
+        <CategoryActions
+          category={selectedCategory}
+          ledger={state.ledger}
+          referenced={state.ledger.transactions.some((t) => t.categoryId === selectedCategory.id)}
+          onCancel={() => setDialog(null)}
+          onChange={change}
+          onDelete={() => {
+            if (confirm('Permanently delete this category?')) {
+              change((l) => ({
+                ...l,
+                categories: l.categories.filter((c) => c.id !== selectedCategory.id),
+              }));
+              setDialog(null);
+            }
           }}
         />
       )}
@@ -247,41 +462,228 @@ export default function App() {
   );
 }
 
-function Welcome({
+function LedgerLibrary({
+  summaries,
   onOpen,
   onNew,
+  onSelect,
+  onDelete,
   dialog,
 }: {
+  summaries: LedgerSummary[];
   onOpen: () => void;
   onNew: () => void;
+  onSelect: (id: string) => void;
+  onDelete: (id: string) => void;
   dialog: ReactNode;
 }) {
   return (
     <div className="welcome">
       <div className="welcome-card">
         <div className="brand-mark large">$</div>
-        <p className="eyebrow">PRIVATE · OFFLINE-FIRST · YOUR FILE</p>
+        <p className="eyebrow">PRIVATE · OFFLINE-FIRST · IN THIS BROWSER</p>
         <h1>Your money, clearly understood.</h1>
         <p className="lead">
-          A calm, portable expense tracker. Your ledger stays in memory and in the JSON file you
-          choose—never in a database or on a server.
+          Your ledgers are saved locally in this browser. Export a JSON backup when moving to
+          another device.
         </p>
         <div className="welcome-actions">
           <button className="primary large-button" onClick={onNew}>
             Create new ledger
           </button>
           <button className="secondary large-button" onClick={onOpen}>
-            Open ledger file
+            Import JSON
           </button>
         </div>
-        <p className="muted">
-          Works offline after the first load. Bring your JSON file with you between devices.
-        </p>
+        {summaries.length > 0 && (
+          <section className="local-ledgers" aria-label="Local ledgers">
+            <h2>Saved ledgers</h2>
+            <div className="mini-list">
+              {summaries.map((summary) => (
+                <div className="mini-row" key={summary.ledgerId}>
+                  <button className="ledger-choice" onClick={() => onSelect(summary.ledgerId)}>
+                    <strong>{summary.name}</strong>
+                    <small>
+                      Revision {summary.revision} · Updated {summary.updatedAt.slice(0, 10)}
+                    </small>
+                  </button>
+                  <button className="danger-link" onClick={() => onDelete(summary.ledgerId)}>
+                    Delete
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+        {!summaries.length && <p className="muted">Create or import a ledger to get started.</p>}
       </div>
       {dialog}
     </div>
   );
 }
+
+function TransactionActions({
+  transaction,
+  ledger,
+  onCancel,
+  onEdit,
+  onDuplicate,
+  onDelete,
+}: {
+  transaction: Transaction;
+  ledger: Ledger;
+  onCancel: () => void;
+  onEdit: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}) {
+  const category = ledger.categories.find((item) => item.id === transaction.categoryId);
+  const money = formatMinorUnits(
+    transaction.amountMinor,
+    ledger.settings.currency,
+    ledger.settings.locale,
+  );
+  return (
+    <Modal title="Transaction" eyebrow="RECORD" onCancel={onCancel}>
+      <dl className="record-details">
+        <dt>Date</dt>
+        <dd>{transaction.date}</dd>
+        <dt>Kind</dt>
+        <dd>{transaction.kind}</dd>
+        <dt>Category</dt>
+        <dd>{category?.name || 'Archived category'}</dd>
+        <dt>Amount</dt>
+        <dd>
+          {transaction.kind === 'income' ? '+' : '-'}
+          {money}
+        </dd>
+        <dt>Note</dt>
+        <dd>{transaction.note || '—'}</dd>
+      </dl>
+      <div className="modal-actions record-action-buttons">
+        <button className="secondary" onClick={onCancel}>
+          Cancel
+        </button>
+        <button className="secondary" onClick={onDuplicate}>
+          Duplicate
+        </button>
+        <button className="primary" onClick={onEdit}>
+          Edit
+        </button>
+        <button className="danger-button" onClick={onDelete}>
+          Delete
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function CategoryActions({
+  category,
+  ledger,
+  referenced,
+  onCancel,
+  onChange,
+  onDelete,
+}: {
+  category: Ledger['categories'][number];
+  ledger: Ledger;
+  referenced: boolean;
+  onCancel: () => void;
+  onChange: (update: (ledger: Ledger) => Ledger) => void;
+  onDelete: () => void;
+}) {
+  const [name, setName] = useState(category.name);
+  const [color, setColor] = useState(category.color);
+  const [error, setError] = useState('');
+  const save = () => {
+    const trimmed = name.trim();
+    if (!trimmed) return setError('Category name cannot be empty.');
+    if (
+      ledger.categories.some(
+        (item) =>
+          item.id !== category.id &&
+          item.kind === category.kind &&
+          item.name.toLocaleLowerCase() === trimmed.toLocaleLowerCase(),
+      )
+    ) {
+      return setError('Category names must be unique within each kind.');
+    }
+    onChange((ledger) => ({
+      ...ledger,
+      categories: ledger.categories.map((item) =>
+        item.id === category.id
+          ? { ...item, name: trimmed, color, updatedAt: new Date().toISOString() }
+          : item,
+      ),
+    }));
+    onCancel();
+  };
+  return (
+    <Modal title={category.name} eyebrow="CATEGORY" onCancel={onCancel}>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          save();
+        }}
+      >
+        <label>
+          Name
+          <input value={name} onChange={(event) => setName(event.target.value)} maxLength={200} />
+        </label>
+        <label>
+          Color
+          <input type="color" value={color} onChange={(event) => setColor(event.target.value)} />
+        </label>
+        {error && (
+          <p className="error" role="alert">
+            {error}
+          </p>
+        )}
+        <div className="modal-actions record-action-buttons">
+          <button type="button" className="secondary" onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => {
+              onChange((ledger) => ({
+                ...ledger,
+                categories: ledger.categories.map((item) =>
+                  item.id === category.id
+                    ? { ...item, archived: !item.archived, updatedAt: new Date().toISOString() }
+                    : item,
+                ),
+              }));
+              onCancel();
+            }}
+          >
+            {category.archived ? 'Restore' : 'Archive'}
+          </button>
+          <button className="primary">Save changes</button>
+          <button
+            type="button"
+            className="danger-button"
+            disabled={referenced}
+            title={
+              referenced ? 'Referenced categories must be archived instead of deleted.' : undefined
+            }
+            onClick={onDelete}
+          >
+            Delete
+          </button>
+        </div>
+        {referenced && (
+          <p className="muted small">
+            This category is used by transactions and must be archived instead of deleted.
+          </p>
+        )}
+      </form>
+    </Modal>
+  );
+}
+
 function NewLedger({
   onCancel,
   onCreate,
@@ -352,7 +754,7 @@ function NewLedger({
           <button type="button" className="secondary" onClick={onCancel}>
             Cancel
           </button>
-          <button className="primary">Create & save copy</button>
+          <button className="primary">Create ledger</button>
         </div>
         <p className="muted small">
           Starter categories are editable. Amounts are stored as integer minor units.
@@ -399,6 +801,12 @@ function Dashboard({ ledger, onAdd }: { ledger: Ledger; onAdd: () => void }) {
     formatMinorUnits(amount, ledger.settings.currency, ledger.settings.locale);
   const categoryName = (id: string) =>
     ledger.categories.find((c) => c.id === id)?.name || 'Archived category';
+  const pieData = stats.categories.map(({ category, amountMinor }) => ({
+    id: category.id,
+    name: category.name,
+    value: amountMinor,
+    color: category.color,
+  }));
   return (
     <>
       <div className="page-heading">
@@ -525,16 +933,37 @@ function Dashboard({ ledger, onAdd }: { ledger: Ledger; onAdd: () => void }) {
             </div>
           </div>
           {stats.categories.length ? (
-            <div className="category-list">
-              {stats.categories.map(({ category, amountMinor, percentage }) => (
-                <div className="category-row" key={category.id}>
-                  <span className="color-dot" style={{ background: category.color }}></span>
-                  <span className="category-label">{category.name}</span>
-                  <span className="category-value">
-                    {money(amountMinor)} <small>{percentage.toFixed(1)}%</small>
-                  </span>
-                </div>
-              ))}
+            <div className="breakdown-content">
+              <div className="pie-chart" role="img" aria-label="Pie chart of expenses by category">
+                <ResponsiveContainer width="100%" height={210}>
+                  <PieChart>
+                    <Pie
+                      data={pieData}
+                      dataKey="value"
+                      nameKey="name"
+                      innerRadius={55}
+                      outerRadius={85}
+                      paddingAngle={2}
+                    >
+                      {pieData.map((item) => (
+                        <Cell key={item.id} fill={item.color} />
+                      ))}
+                    </Pie>
+                    <Tooltip formatter={(value) => money(typeof value === 'number' ? value : 0)} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="category-list">
+                {stats.categories.map(({ category, amountMinor, percentage }) => (
+                  <div className="category-row" key={category.id}>
+                    <span className="color-dot" style={{ background: category.color }}></span>
+                    <span className="category-label">{category.name}</span>
+                    <span className="category-value">
+                      {money(amountMinor)} <small>{percentage.toFixed(1)}%</small>
+                    </span>
+                  </div>
+                ))}
+              </div>
             </div>
           ) : (
             <Empty text="No expenses in this period." />
@@ -623,28 +1052,26 @@ function Transactions({
   onChange,
   onAdd,
   onEdit,
+  onSelect,
 }: {
   ledger: Ledger;
   onChange: (update: (ledger: Ledger) => Ledger) => void;
   onAdd: () => void;
   onEdit: (transaction: Transaction) => void;
+  onSelect: (transaction: Transaction) => void;
 }) {
   const [filters, setFilters] = useState<TransactionFilters>({
     categoryIds: [],
     note: '',
     kind: 'all',
   });
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [sort, setSort] = useState<SortState>({ key: 'date', direction: 'desc' });
   const rows = filterTransactions(ledger.transactions, ledger.categories, filters, sort);
   const money = (amount: number) =>
     formatMinorUnits(amount, ledger.settings.currency, ledger.settings.locale);
   const categoryName = (id: string) =>
     ledger.categories.find((c) => c.id === id)?.name || 'Archived category';
-  const sortBy = (key: SortState['key']) =>
-    setSort((current) => ({
-      key,
-      direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc',
-    }));
   const remove = (id: string) => {
     if (confirm('Delete this transaction?'))
       onChange((l) => ({ ...l, transactions: l.transactions.filter((t) => t.id !== id) }));
@@ -663,7 +1090,14 @@ function Transactions({
           + Add transaction
         </button>
       </div>
-      <section className="panel filters">
+      <button
+        className="secondary filter-toggle"
+        aria-expanded={filtersOpen}
+        onClick={() => setFiltersOpen((open) => !open)}
+      >
+        Filter
+      </button>
+      <section className={filtersOpen ? 'panel filters filters-open' : 'panel filters'}>
         <div className="filter-grid">
           <label>
             From
@@ -694,6 +1128,33 @@ function Transactions({
               <option value="income">Income</option>
             </select>
           </label>
+          <label>
+            Category
+            <select
+              aria-label="Category"
+              value={filters.categoryIds[0] || ''}
+              onChange={(e) =>
+                setFilters({ ...filters, categoryIds: e.target.value ? [e.target.value] : [] })
+              }
+            >
+              <option value="">All categories</option>
+              {(['expense', 'income'] as TransactionKind[]).map((categoryKind) => (
+                <optgroup
+                  key={categoryKind}
+                  label={categoryKind === 'expense' ? 'Expense categories' : 'Income categories'}
+                >
+                  {ledger.categories
+                    .filter((category) => category.kind === categoryKind)
+                    .map((category) => (
+                      <option key={category.id} value={category.id}>
+                        {category.name}
+                        {category.archived ? ' (archived)' : ''}
+                      </option>
+                    ))}
+                </optgroup>
+              ))}
+            </select>
+          </label>
           <label className="filter-wide">
             Note search
             <input
@@ -701,6 +1162,31 @@ function Transactions({
               onChange={(e) => setFilters({ ...filters, note: e.target.value })}
               placeholder="Search notes"
             />
+          </label>
+          <label>
+            Sort by
+            <select
+              value={sort.key}
+              onChange={(e) => setSort({ ...sort, key: e.target.value as SortState['key'] })}
+            >
+              <option value="date">Date</option>
+              <option value="amountMinor">Amount</option>
+              <option value="category">Category</option>
+              <option value="createdAt">Created</option>
+              <option value="updatedAt">Updated</option>
+            </select>
+          </label>
+          <label>
+            Direction
+            <select
+              value={sort.direction}
+              onChange={(e) =>
+                setSort({ ...sort, direction: e.target.value as SortState['direction'] })
+              }
+            >
+              <option value="desc">Descending</option>
+              <option value="asc">Ascending</option>
+            </select>
           </label>
           <button
             className="secondary clear-button"
@@ -715,16 +1201,10 @@ function Transactions({
           <table>
             <thead>
               <tr>
-                <th>
-                  <button onClick={() => sortBy('date')}>Date ↕</button>
-                </th>
+                <th>Date</th>
                 <th>Kind</th>
-                <th>
-                  <button onClick={() => sortBy('category')}>Category ↕</button>
-                </th>
-                <th>
-                  <button onClick={() => sortBy('amountMinor')}>Amount ↕</button>
-                </th>
+                <th>Category</th>
+                <th>Amount</th>
                 <th>Note</th>
                 <th>Actions</th>
               </tr>
@@ -748,12 +1228,18 @@ function Transactions({
                     <button onClick={() => onEdit(t)}>Edit</button>
                     <button
                       onClick={() =>
-                        onEdit({
-                          ...t,
-                          id: makeId(),
-                          createdAt: new Date().toISOString(),
-                          updatedAt: new Date().toISOString(),
-                        })
+                        onChange((l) => ({
+                          ...l,
+                          transactions: [
+                            ...l.transactions,
+                            {
+                              ...t,
+                              id: makeId(),
+                              createdAt: new Date().toISOString(),
+                              updatedAt: new Date().toISOString(),
+                            },
+                          ],
+                        }))
                       }
                     >
                       Duplicate
@@ -766,6 +1252,24 @@ function Transactions({
               ))}
             </tbody>
           </table>
+          <div className="mobile-record-list">
+            {rows.map((t) => (
+              <button className="mobile-record" key={t.id} onClick={() => onSelect(t)}>
+                <span className="transaction-kind">{t.kind === 'income' ? '↗' : '↘'}</span>
+                <span className="mobile-record-copy">
+                  <strong>{categoryName(t.categoryId)}</strong>
+                  <small>
+                    {t.date}
+                    {t.note ? ` · ${t.note}` : ''}
+                  </small>
+                </span>
+                <strong className={t.kind === 'income' ? 'income-text' : 'expense-text'}>
+                  {t.kind === 'income' ? '+' : '-'}
+                  {money(t.amountMinor)}
+                </strong>
+              </button>
+            ))}
+          </div>
           {!rows.length && (
             <Empty
               text={
@@ -784,11 +1288,13 @@ function Transactions({
 function TransactionDialog({
   ledger,
   initial,
+  mode,
   onCancel,
   onSave,
 }: {
   ledger: Ledger;
   initial: Transaction | null;
+  mode: 'add' | 'edit' | 'duplicate';
   onCancel: () => void;
   onSave: (transaction: Transaction) => void;
 }) {
@@ -806,8 +1312,14 @@ function TransactionDialog({
   );
   return (
     <Modal
-      title={initial ? 'Edit transaction' : 'Add transaction'}
-      eyebrow={initial ? 'UPDATE' : 'NEW TRANSACTION'}
+      title={
+        mode === 'edit'
+          ? 'Edit transaction'
+          : mode === 'duplicate'
+            ? 'Duplicate transaction'
+            : 'Add transaction'
+      }
+      eyebrow={mode === 'edit' ? 'UPDATE' : mode === 'duplicate' ? 'DUPLICATE' : 'NEW TRANSACTION'}
       onCancel={onCancel}
     >
       <form
@@ -819,7 +1331,7 @@ function TransactionDialog({
             if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Enter a valid date.');
             if (!categoryId) throw new Error('Choose a category.');
             onSave(
-              initial
+              mode === 'edit' && initial
                 ? {
                     ...initial,
                     date,
@@ -899,7 +1411,13 @@ function TransactionDialog({
           <button type="button" className="secondary" onClick={onCancel}>
             Cancel
           </button>
-          <button className="primary">{initial ? 'Save changes' : 'Add transaction'}</button>
+          <button className="primary">
+            {mode === 'edit'
+              ? 'Save changes'
+              : mode === 'duplicate'
+                ? 'Add duplicate'
+                : 'Add transaction'}
+          </button>
         </div>
       </form>
     </Modal>
@@ -909,9 +1427,11 @@ function TransactionDialog({
 function Categories({
   ledger,
   onChange,
+  onSelect,
 }: {
   ledger: Ledger;
   onChange: (update: (ledger: Ledger) => Ledger) => void;
+  onSelect: (category: Ledger['categories'][number]) => void;
 }) {
   const [name, setName] = useState('');
   const [kind, setKind] = useState<TransactionKind>('expense');
@@ -1071,6 +1591,14 @@ function Categories({
                       </button>
                     )}
                   </span>
+                  <button className="mobile-category-card" onClick={() => onSelect(c)}>
+                    <span className="color-dot" style={{ background: c.color }}></span>
+                    <span>
+                      <strong>{c.name}</strong>
+                      {c.archived && <small>Archived</small>}
+                    </span>
+                    <span aria-hidden="true">›</span>
+                  </button>
                 </div>
               ))}
             {!ledger.categories.some((c) => c.kind === categoryKind) && (
@@ -1206,8 +1734,8 @@ function Settings({
       <section className="panel about">
         <h2>Data and privacy</h2>
         <p>
-          Your ledger is held in memory for this session. The JSON file is the canonical copy; the
-          application does not use a backend, account, analytics, or browser database.
+          Your ledger is autosaved in this browser's IndexedDB. JSON is used for imports and
+          explicit backups; the application does not use a backend, account, or analytics.
         </p>
         <dl>
           <dt>Schema</dt>
@@ -1220,8 +1748,8 @@ function Settings({
           <dd>{ledger.updatedAt}</dd>
         </dl>
         <p className="muted">
-          Static hosting delivers application code only. Clearing site data may require reopening
-          the app online to restore its offline shell.
+          Local ledgers are specific to this browser profile. Export a JSON backup before clearing
+          site data or moving to another device; static hosting receives application code only.
         </p>
       </section>
     </>

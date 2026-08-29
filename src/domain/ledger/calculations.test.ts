@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { balanceAt, categoryTotals, dashboardStats } from './calculations';
+import { balanceAt, categoryTotals, dashboardStats, filterTransactions } from './calculations';
 import type { Ledger } from './types';
 
 const ledger: Ledger = {
@@ -80,5 +80,15 @@ describe('ledger calculations', () => {
     expect(stats.expenses).toBe(1250);
     expect(stats.net).toBe(3750);
     expect(stats.averageDailyExpense).toBe(208);
+  });
+  it('filters transactions by category', () => {
+    const rows = filterTransactions(
+      ledger.transactions,
+      ledger.categories,
+      { categoryIds: ['e897aeb6-0001-4f00-a001-000000000001'], note: '', kind: 'all' },
+      { key: 'date', direction: 'desc' },
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].categoryId).toBe('e897aeb6-0001-4f00-a001-000000000001');
   });
 });

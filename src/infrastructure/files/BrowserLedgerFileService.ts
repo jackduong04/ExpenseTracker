@@ -27,7 +27,7 @@ function supportsIOSFileSharing(): boolean {
   );
 }
 export class BrowserLedgerFileService implements LedgerFileService {
-  async open() {
+  async importLedger() {
     const picker = (
       window as Window & {
         showOpenFilePicker?: (
@@ -49,14 +49,13 @@ export class BrowserLedgerFileService implements LedgerFileService {
           ledger: parseLedger(text, file.size),
           filename: file.name,
           hash: await contentHash(text),
-          handle,
         };
       } catch (error) {
         if ((error as DOMException).name === 'AbortError') return null;
         throw error;
       }
     }
-    return new Promise<{ ledger: Ledger; filename: string; hash: string; handle?: unknown } | null>(
+    return new Promise<{ ledger: Ledger; filename: string; hash: string } | null>(
       (resolve, reject) => {
         const input = document.createElement('input');
         input.type = 'file';
@@ -76,27 +75,6 @@ export class BrowserLedgerFileService implements LedgerFileService {
         input.click();
       },
     );
-  }
-  async save(ledger: Ledger, handle?: unknown) {
-    const text = stableSerialize(ledger);
-    const hash = await contentHash(text);
-    const filename = filenameFor(ledger);
-    const candidate = handle as
-      | {
-          createWritable?: () => Promise<{
-            write: (data: string) => Promise<void>;
-            close: () => Promise<void>;
-          }>;
-        }
-      | undefined;
-    if (candidate?.createWritable) {
-      const writable = await candidate.createWritable();
-      await writable.write(text);
-      await writable.close();
-      return { filename, hash, handle };
-    }
-    download(text, filename);
-    return { filename, hash };
   }
   async exportCopy(ledger: Ledger) {
     const text = stableSerialize(ledger);

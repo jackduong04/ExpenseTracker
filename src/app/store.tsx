@@ -10,14 +10,20 @@ import type { Category, Ledger, LedgerSettings, Transaction } from '../domain/le
 import { stableSerialize } from '../infrastructure/schema/parse-ledger';
 
 type Action =
-  | { type: 'load'; ledger: Ledger; filename: string; hash: string; handle?: unknown }
+  | { type: 'load'; ledger: Ledger; filename: string; hash: string }
   | { type: 'close' }
-  | { type: 'saved'; ledger: Ledger; filename: string; hash: string; handle?: unknown }
+  | { type: 'saved'; ledger: Ledger; filename: string; hash: string }
+  | {
+      type: 'autosaved';
+      ledger: Ledger;
+      filename: string;
+      hash: string;
+      sourceSnapshot: string;
+    }
   | { type: 'ledger'; update: (ledger: Ledger) => Ledger };
 export interface AppState {
   ledger: Ledger | null;
   filename: string | null;
-  handle?: unknown;
   savedSnapshot: string | null;
   savedHash: string | null;
   error: string | null;
@@ -26,7 +32,6 @@ export interface AppState {
 const initialState: AppState = {
   ledger: null,
   filename: null,
-  handle: undefined,
   savedSnapshot: null,
   savedHash: null,
   error: null,
@@ -38,7 +43,6 @@ export function reducer(state: AppState, action: Action): AppState {
     return {
       ledger: action.ledger,
       filename: action.filename,
-      handle: action.handle,
       savedSnapshot: stableSerialize(action.ledger),
       savedHash: action.hash,
       error: null,
@@ -50,12 +54,29 @@ export function reducer(state: AppState, action: Action): AppState {
       ...state,
       ledger: action.ledger,
       filename: action.filename,
-      handle: action.handle ?? state.handle,
       savedSnapshot: stableSerialize(action.ledger),
       savedHash: action.hash,
       message: `Saved revision ${action.ledger.revision}`,
       error: null,
     };
+  if (action.type === 'autosaved') {
+    const currentSnapshot = state.ledger ? stableSerialize(state.ledger) : null;
+    const unchanged = currentSnapshot === action.sourceSnapshot;
+    const currentLedger = unchanged
+      ? action.ledger
+      : state.ledger
+        ? { ...state.ledger, revision: action.ledger.revision }
+        : action.ledger;
+    return {
+      ...state,
+      ledger: currentLedger,
+      filename: action.filename,
+      savedSnapshot: stableSerialize(action.ledger),
+      savedHash: action.hash,
+      message: unchanged ? `Saved locally at revision ${action.ledger.revision}` : null,
+      error: null,
+    };
+  }
   if (action.type === 'ledger')
     return { ...state, ledger: action.update(state.ledger!), error: null, message: null };
   return state;
