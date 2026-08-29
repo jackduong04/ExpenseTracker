@@ -791,6 +791,11 @@ dd {
   }
 }
 @media (max-width: 600px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
   .topbar {
     min-height: 62px;
   }
