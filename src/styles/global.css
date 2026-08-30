@@ -846,23 +846,30 @@ dd {
   .sidebar {
     position: fixed;
     z-index: 4;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    width: 100%;
-    height: calc(62px + env(safe-area-inset-bottom, 0px));
-    border: 0;
-    border-top: 1px solid var(--line);
-    padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    left: 14px;
+    right: 14px;
+    width: auto;
+    height: 64px;
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    padding: 6px;
+    background: var(--surface);
+    box-shadow: 0 8px 22px #102c2717;
     flex-direction: row;
-    justify-content: space-around;
+    justify-content: stretch;
   }
   .nav-item {
     flex: 1;
     justify-content: center;
+    min-height: 50px;
+    border-radius: 14px;
   }
   .main-content {
-    padding: 26px 14px calc(90px + env(safe-area-inset-bottom, 0px));
+    padding: 26px 14px calc(108px + env(safe-area-inset-bottom, 0px));
+  }
+  .toast {
+    bottom: calc(92px + env(safe-area-inset-bottom, 0px));
   }
   .page-heading {
     align-items: flex-start;
